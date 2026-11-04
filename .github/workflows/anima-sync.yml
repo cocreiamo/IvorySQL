@@ -1,0 +1,114 @@
+# Installed in the fork cocreiamo/IvorySQL as .github/workflows/anima-sync.yml on its default
+# branch anima/ci (docs/upstream.md#fork-model). Rebases each anima/* branch, which carries
+# only our fixes, onto its upstream branch. On failure (conflict or refused push) it pushes
+# nothing more and opens (or updates) an issue in the fork; the Anima build keeps its pinned
+# commit meanwhile.
+name: anima-sync
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: anima-sync
+  cancel-in-progress: false
+
+jobs:
+  rebase:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - branch: anima/master
+            upstream: master
+          - branch: anima/5.6
+            upstream: IVORY_REL_5_STABLE
+    env:
+      BRANCH: ${{ matrix.branch }}
+      UPSTREAM: ${{ matrix.upstream }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ matrix.branch }}
+          fetch-depth: 0
+          # GITHUB_TOKEN cannot push commits that change .github/workflows/; if upstream
+          # changes a workflow the push is refused (reported below) until a token with the
+          # "workflows" permission is stored as the ANIMA_SYNC_TOKEN secret.
+          token: ${{ secrets.ANIMA_SYNC_TOKEN || github.token }}
+
+      - name: Rebase on upstream
+        id: rebase
+        run: |
+          set -euo pipefail
+          git config user.name "anima-sync"
+          git config user.email "anima-sync@users.noreply.github.com"
+          git remote add upstream https://github.com/IvorySQL/IvorySQL.git
+          git fetch --no-tags upstream "$UPSTREAM"
+          if git merge-base --is-ancestor "upstream/$UPSTREAM" HEAD; then
+            echo "up to date with upstream/$UPSTREAM"
+            echo "result=noop" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Our commits that upstream already merged (same patch) are dropped by rebase.
+          if git rebase "upstream/$UPSTREAM"; then
+            echo "result=rebased" >> "$GITHUB_OUTPUT"
+          else
+            git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicts.txt" || true
+            git rebase --abort
+            echo "result=conflict" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push rebased branch
+        if: steps.rebase.outputs.result == 'rebased'
+        run: |
+          set -euo pipefail
+          # Keep the previous head reachable: the Anima build pins commits by SHA.
+          old=$(git rev-parse "origin/$BRANCH")
+          tag="anima-sync/${BRANCH#anima/}-$(date -u +%Y%m%d)-${old:0:12}"
+          if [ -z "$(git ls-remote --tags origin "refs/tags/$tag")" ]; then
+            git push origin "$old:refs/tags/$tag"
+          fi
+          git push --force-with-lease="refs/heads/$BRANCH:$old" origin "HEAD:refs/heads/$BRANCH"
+
+      - name: Close a previous failure issue
+        if: steps.rebase.outputs.result == 'noop' || steps.rebase.outputs.result == 'rebased'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          title="anima-sync: $BRANCH does not sync with $UPSTREAM"
+          for n in $(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$title\"" --json number,title --jq ".[] | select(.title == \"$title\") | .number"); do
+            gh issue close "$n" --repo "$GITHUB_REPOSITORY" --comment "Synced again in $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          done
+
+      - name: Report failure
+        if: failure() || steps.rebase.outputs.result == 'conflict'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RESULT: ${{ steps.rebase.outputs.result }}
+        run: |
+          set -euo pipefail
+          title="anima-sync: $BRANCH does not sync with $UPSTREAM"
+          run_url="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          if [ "$RESULT" = conflict ]; then
+            body=$(printf 'Rebase of `%s` onto upstream `%s` (%s) stopped on conflicts in:\n\n%s\n\nNothing was pushed. Run: %s\n' \
+              "$BRANCH" "$UPSTREAM" "$(git rev-parse --short "upstream/$UPSTREAM")" \
+              "$(sed 's/^/- /' "$RUNNER_TEMP/conflicts.txt")" "$run_url")
+          else
+            body=$(printf 'Sync of `%s` with upstream `%s` failed (result: `%s`); see the log: %s\n' \
+              "$BRANCH" "$UPSTREAM" "${RESULT:-none}" "$run_url")
+          fi
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$title\"" --json number,title --jq ".[] | select(.title == \"$title\") | .number" | head -n1)
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi
+          if [ "$RESULT" = conflict ]; then exit 1; fi
